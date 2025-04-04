@@ -1,6 +1,7 @@
 #pragma once
 
 /** @file Nested parallel case for NetlistRouter */
+#include "connection_router_interface.h"
 #include "netlist_routers.h"
 #include "vtr_optional.h"
 #include "vtr_thread_pool.h"
@@ -73,7 +74,7 @@ class NestedNetlistRouter : public NetlistRouter {
     /** Route all nets in a PartitionTree node and add its children to the task queue. */
     void route_partition_tree_node(PartitionTreeNode& node);
 
-    ConnectionRouter<HeapType>* _make_router(const RouterLookahead* router_lookahead,
+    ConnectionRouterInterface* _make_router(const RouterLookahead* router_lookahead,
                                              const t_router_opts& router_opts,
                                              bool is_flat) {
         auto& device_ctx = g_vpr_ctx.device();
@@ -134,13 +135,13 @@ class NestedNetlistRouter : public NetlistRouter {
 
     /* Thread-local storage.
      * These are maps because thread::id is a random integer instead of 1, 2, ... */
-    std::unordered_map<std::thread::id, ConnectionRouter<HeapType>*> _routers_th;
+    std::unordered_map<std::thread::id, ConnectionRouterInterface*> _routers_th;
     std::unordered_map<std::thread::id, RouteIterResults> _results_th;
     std::mutex _storage_mutex;
 
     /** Get a thread-local ConnectionRouter. We lock the id->router lookup, but this is
      * accessed once per partition so the overhead should be small */
-    ConnectionRouter<HeapType>* get_thread_router() {
+    ConnectionRouterInterface* get_thread_router() {
         auto id = std::this_thread::get_id();
         std::lock_guard<std::mutex> lock(_storage_mutex);
         if (!_routers_th.count(id)) {

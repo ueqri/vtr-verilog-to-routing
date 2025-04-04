@@ -1,7 +1,14 @@
 #ifndef _PARALLEL_CONNECTION_ROUTER_H
 #define _PARALLEL_CONNECTION_ROUTER_H
 
-#include "connection_router.h"
+#include "connection_router_interface.h"
+#include "rr_graph_storage.h"
+#include "route_common.h"
+#include "router_lookahead.h"
+#include "route_tree.h"
+#include "rr_rc_data.h"
+#include "router_stats.h"
+#include "spatial_route_tree_lookup.h"
 
 #include "d_ary_heap.h"
 #include "multi_queue_d_ary_heap.h"
@@ -11,71 +18,32 @@
 #include <mutex>
 #include <condition_variable>
 
-/**
- * @brief Spin lock implementation using std::atomic_flag
- *
- * It is used per RR node for protecting the update to node costs
- * to prevent data races. Since different threads rarely work on
- * the same node simultaneously, this fine-grained locking strategy
- * of one lock per node reduces contention.
- */
 class spin_lock_t {
-    /** Atomic flag used for the lock implementation */
     std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
-
-  public:
-    /**
-     * @brief Acquires the spin lock, repeatedly attempting until successful
-     */
+public:
     void acquire() {
-        while (std::atomic_flag_test_and_set_explicit(&lock_, std::memory_order_acquire))
-            ;
+        while (std::atomic_flag_test_and_set_explicit(&lock_, std::memory_order_acquire));
     }
 
-    /**
-     * @brief Releases the spin lock, allowing other threads to acquire it
-     */
     void release() {
         std::atomic_flag_clear_explicit(&lock_, std::memory_order_release);
     }
 };
 
-/**
- * @brief Thread barrier implementation using std::mutex
- *
- * It ensures all participating threads reach a synchronization point
- * before any are allowed to proceed further. It uses a mutex and
- * condition variable to coordinate thread synchronization.
- */
 class barrier_mutex_t {
-    // FIXME: Try std::barrier (since C++20) to replace this mutex barrier
     std::mutex mutex_;
     std::condition_variable cv_;
     size_t count_;
     size_t max_count_;
     size_t generation_ = 0;
+public:
+    explicit barrier_mutex_t(size_t num_threads) : count_(num_threads), max_count_(num_threads) { }
 
-  public:
-    /**
-     * @brief Constructs a barrier for a specific number of threads
-     * @param num_threads Number of threads that must call wait() before
-     * any thread is allowed to proceed
-     */
-    explicit barrier_mutex_t(size_t num_threads)
-        : count_(num_threads)
-        , max_count_(num_threads) {}
-
-    /**
-     * @brief Blocks the calling thread until all threads have called wait()
-     *
-     * When the specified number of threads have called this method, all
-     * threads are unblocked and the barrier is reset for the next use.
-     */
     void wait() {
         std::unique_lock<std::mutex> lock{mutex_};
         size_t gen = generation_;
         if (--count_ == 0) {
-            generation_++;
+            generation_ ++;
             count_ = max_count_;
             cv_.notify_all();
         } else {
@@ -84,50 +52,19 @@ class barrier_mutex_t {
     }
 };
 
-/**
- * @brief Spin-based thread barrier implementation using std::atomic
- *
- * It ensures all participating threads reach a synchronization point
- * before any are allowed to proceed further. It uses atomic operations
- * to implement Sense-Reversing Centralized Barrier (from Section 5.2.1
- * of Michael L. Scott's textbook) without using mutex locks.
- */
 class barrier_spin_t {
-    /** Number of threads that must reach the barrier */
     size_t num_threads_ = 1;
-
-    /** Atomic counter tracking the number of threads that have arrived at the barrier */
     std::atomic<size_t> count_ = 0;
-
-    /** Global sense shared by all participating threads */
-    std::atomic<bool> sense_ = false;
-
-    /** Thread-local sense value for each participating thread */
+    std::atomic<bool> sense_ = false; // global sense shared by multiple threads
     inline static thread_local bool local_sense_ = false;
 
-  public:
-    /**
-     * @brief Constructs a barrier for a specific number of threads
-     * @param num_threads Number of threads that must call wait() before
-     * any thread is allowed to proceed
-     */
+public:
     explicit barrier_spin_t(size_t num_threads) { num_threads_ = num_threads; }
 
-    /**
-     * @brief Initializes the thread-local sense flag
-     * @note Should be called by each thread before first using the barrier.
-     */
     void init() {
         local_sense_ = false;
     }
 
-    /**
-     * @brief Blocks the calling thread until all threads have called wait()
-     *
-     * Uses a sense-reversing algorithm to synchronize threads. The last thread
-     * to arrive unblocks all waiting threads. This method avoids using locks or
-     * condition variables, making it potentially more efficient for short waits.
-     */
     void wait() {
         bool s = !local_sense_;
         local_sense_ = s;
@@ -136,24 +73,23 @@ class barrier_spin_t {
             count_.store(0);
             sense_.store(s);
         } else {
-            while (sense_.load() != s)
-                ; // spin until the last thread arrives
+            while (sense_.load() != s) ;
         }
     }
 };
 
-using barrier_t = barrier_spin_t; // Using the spin-based thread barrier
+using barrier_t = barrier_spin_t;
 
-/**
- * @class ParallelConnectionRouter implements the MultiQueue-based parallel connection
- * router (FPT'24) based on the ConnectionRouter interface.
- * @details The details of the algorithm can be found from the conference paper:
- * A. Singer, H. Yan, G. Zhang, M. Jeffrey, M. Stojilovic and V. Betz, "MultiQueue-Based FPGA Routing:
- * Relaxed A* Priority Ordering for Improved Parallelism," Int. Conf. on Field-Programmable Technology,
- * Dec. 2024.
- */
+// This class encapsulates the timing driven connection router. This class
+// routes from some initial set of sources (via the input rt tree) to a
+// particular sink.
+//
+// When the ParallelConnectionRouter is used, it mutates the provided
+// rr_node_route_inf.  The routed path can be found by tracing from the sink
+// node (which is returned) through the rr_node_route_inf.  See
+// update_traceback as an example of this tracing.
 template<typename HeapImplementation>
-class ParallelConnectionRouter : public ConnectionRouter<HeapImplementation> {
+class ParallelConnectionRouter : public ConnectionRouterInterface {
   public:
     ParallelConnectionRouter(
         const DeviceGrid& grid,
@@ -167,47 +103,58 @@ class ParallelConnectionRouter : public ConnectionRouter<HeapImplementation> {
         int multi_queue_num_threads,
         int multi_queue_num_queues,
         bool multi_queue_direct_draining)
-        : ConnectionRouter<HeapImplementation>(grid, router_lookahead, rr_nodes, rr_graph, rr_rc_data, rr_switch_inf, rr_node_route_inf, is_flat)
+        : grid_(grid)
+        , router_lookahead_(router_lookahead)
+        , rr_nodes_(rr_nodes.view())
+        , rr_graph_(rr_graph)
+        , rr_rc_data_(rr_rc_data.data(), rr_rc_data.size())
+        , rr_switch_inf_(rr_switch_inf.data(), rr_switch_inf.size())
+        , net_terminal_groups(g_vpr_ctx.routing().net_terminal_groups)
+        , net_terminal_group_num(g_vpr_ctx.routing().net_terminal_group_num)
+        , rr_node_route_inf_(rr_node_route_inf)
+        , is_flat_(is_flat)
         , modified_rr_node_inf_(multi_queue_num_threads)
+        , router_stats_(nullptr)
         , heap_(multi_queue_num_threads, multi_queue_num_queues)
         , thread_barrier_(multi_queue_num_threads)
         , is_router_destroying_(false)
         , locks_(rr_node_route_inf.size())
-        , multi_queue_direct_draining_(multi_queue_direct_draining) {
-        // Initialize the thread barrier
-        this->thread_barrier_.init();
-        // Instantiate (multi_queue_num_threads - 1) helper threads
-        this->sub_threads_.resize(multi_queue_num_threads - 1);
-        for (int i = 0; i < multi_queue_num_threads - 1; ++i) {
-            this->sub_threads_[i] = std::thread(&ParallelConnectionRouter::timing_driven_find_single_shortest_path_from_heap_sub_thread_wrapper, this, i + 1 /*0: main thread*/);
-            this->sub_threads_[i].detach();
+        , multi_queue_direct_draining_(multi_queue_direct_draining)
+        , router_debug_(false)
+        , path_search_cumulative_time(0) {
+        heap_.init_heap(grid);
+        only_opin_inter_layer = (grid.get_num_layers() > 1) && inter_layer_connections_limited_to_opin(*rr_graph);
+
+        sub_threads_.resize(multi_queue_num_threads - 1);
+        thread_barrier_.init();
+        for (int i = 0 ; i < multi_queue_num_threads - 1; ++i) {
+            sub_threads_[i] = std::thread(&ParallelConnectionRouter::timing_driven_route_connection_from_heap_sub_thread_wrapper, this, i + 1 /*0: main thread*/);
+            sub_threads_[i].detach();
         }
     }
 
     ~ParallelConnectionRouter() {
-        this->is_router_destroying_ = true; // signal the helper threads to exit
-        this->thread_barrier_.wait();       // wait until all threads reach the barrier
+        is_router_destroying_ = true;
+        thread_barrier_.wait();
 
         VTR_LOG("Parallel Connection Router is being destroyed. Time spent on path search: %.3f seconds.\n",
-                std::chrono::duration<float /*convert to seconds by default*/>(this->path_search_cumulative_time).count());
+                std::chrono::duration<float/*convert to seconds by default*/>(path_search_cumulative_time).count());
     }
 
-    /**
-     * @brief Clears the modified list per thread
-     * @note Should be called after reset_path_costs have been called
-     */
+    // Clear's the modified list.  Should be called after reset_path_costs
+    // have been called.
     void clear_modified_rr_node_info() final {
-        for (auto& thread_visited_rr_nodes : this->modified_rr_node_inf_) {
+        for (auto& thread_visited_rr_nodes : modified_rr_node_inf_) {
             thread_visited_rr_nodes.clear();
         }
     }
 
-    /**
-     * @brief Resets modified data in rr_node_route_inf based on modified_rr_node_inf
-     */
+    // Reset modified data in rr_node_route_inf based on modified_rr_node_inf.
+    // Derived from `reset_path_costs` from route_common.cpp as a specific version
+    // for the parallel connection router.
     void reset_path_costs() final {
         auto& route_ctx = g_vpr_ctx.mutable_routing();
-        for (const auto& thread_visited_rr_nodes : this->modified_rr_node_inf_) {
+        for (const auto& thread_visited_rr_nodes : modified_rr_node_inf_) {
             for (const auto node : thread_visited_rr_nodes) {
                 route_ctx.rr_node_route_inf[node].path_cost = std::numeric_limits<float>::infinity();
                 route_ctx.rr_node_route_inf[node].backward_path_cost = std::numeric_limits<float>::infinity();
@@ -216,113 +163,143 @@ class ParallelConnectionRouter : public ConnectionRouter<HeapImplementation> {
         }
     }
 
-    /**
-     * @brief [Not supported] Enables RCV feature
-     * @note RCV for parallel connection router has not been implemented yet.
-     * Thus this function is not expected to be called.
-     */
-    void set_rcv_enabled(bool) final {
-        VPR_FATAL_ERROR(VPR_ERROR_ROUTE, "RCV for parallel connection router not yet implemented. Not expected to be called.");
-    }
+    /** Finds a path from the route tree rooted at rt_root to sink_node.
+     * This is used when you want to allow previous routing of the same net to
+     * serve as valid start locations for the current connection.
+     *
+     * Returns a tuple of:
+     * bool: path exists? (hard failure, rr graph disconnected)
+     * bool: should retry with full bounding box? (only used in parallel routing)
+     * RTExploredNode: the explored sink node, from which the cheapest path can be found via back-tracing */
+    std::tuple<bool, bool, RTExploredNode> timing_driven_route_connection_from_route_tree(
+        const RouteTreeNode& rt_root,
+        RRNodeId sink_node,
+        const t_conn_cost_params& cost_params,
+        const t_bb& bounding_box,
+        RouterStats& router_stats,
+        const ConnectionParameters& conn_params) final;
 
-    /**
-     * @brief [Not supported] Finds shortest paths from the route tree rooted at rt_root to all sinks available
-     * @note This function has not been implemented yet and is not the focus of parallel connection router.
-     * Thus this function is not expected to be called.
-     */
+    /** Finds a path from the route tree rooted at rt_root to sink_node for a
+     * high fanout net.
+     *
+     * Unlike timing_driven_route_connection_from_route_tree(), only part of
+     * the route tree which is spatially close to the sink is added to the heap.
+     *
+     * Returns a tuple of:
+     * bool: path exists? (hard failure, rr graph disconnected)
+     * bool: should retry with full bounding box? (only used in parallel routing)
+     * RTExploredNode: the explored sink node, from which the cheapest path can be found via back-tracing */
+    std::tuple<bool, bool, RTExploredNode> timing_driven_route_connection_from_route_tree_high_fanout(
+        const RouteTreeNode& rt_root,
+        RRNodeId sink_node,
+        const t_conn_cost_params& cost_params,
+        const t_bb& net_bounding_box,
+        const SpatialRouteTreeLookup& spatial_rt_lookup,
+        RouterStats& router_stats,
+        const ConnectionParameters& conn_params) final;
+
+    // Finds a path from the route tree rooted at rt_root to all sinks
+    // available.
+    //
+    // Each element of the returned vector is a reachable sink.
+    //
+    // If cost_params.astar_fac is set to 0, this effectively becomes
+    // Dijkstra's algorithm with a modified exit condition (runs until heap is
+    // empty).  When using cost_params.astar_fac = 0, for efficiency the
+    // RouterLookahead used should be the NoOpLookahead.
+    //
+    // Note: This routine is currently used only to generate information that
+    // may be helpful in debugging an architecture.
     vtr::vector<RRNodeId, RTExploredNode> timing_driven_find_all_shortest_paths_from_route_tree(
-        const RouteTreeNode&,
-        const t_conn_cost_params&,
-        const t_bb&,
-        RouterStats&,
-        const ConnectionParameters&) final {
-        VPR_FATAL_ERROR(VPR_ERROR_ROUTE, "timing_driven_find_all_shortest_paths_from_route_tree not yet implemented (nor is the focus of the parallel connection router). Not expected to be called.");
+        const RouteTreeNode& rt_root,
+        const t_conn_cost_params& cost_params,
+        const t_bb& bounding_box,
+        RouterStats& router_stats,
+        const ConnectionParameters& conn_params) final;
+
+    void set_router_debug(bool router_debug) final {
+        router_debug_ = router_debug;
     }
 
-  protected:
-    /**
-     * @brief Marks that data associated with rr_node 'inode' has
-     * been modified, and needs to be reset in reset_path_costs
-     */
-    inline void add_to_mod_list(RRNodeId inode, size_t thread_idx) {
-        if (std::isinf(this->rr_node_route_inf_[inode].path_cost)) {
-            this->modified_rr_node_inf_[thread_idx].push_back(inode);
+    // Empty the route tree set used for RCV node detection
+    // Will return if RCV is disabled
+    // Called after each net is finished routing to flush the set
+    void empty_rcv_route_tree_set() final;
+
+    // Enable or disable RCV in connection router
+    // Enabling this will utilize extra path structures, as well as the RCV cost function
+    //
+    // Ensure route budgets have been calculated before enabling this
+    void set_rcv_enabled(bool enable) final;
+
+  private:
+    // Mark that data associated with rr_node "inode" has been modified, and
+    // needs to be reset in reset_path_costs.
+    void add_to_mod_list(RRNodeId inode, size_t thread_idx) {
+        if (std::isinf(rr_node_route_inf_[inode].path_cost)) {
+            modified_rr_node_inf_[thread_idx].push_back(inode);
         }
     }
 
-    /**
-     * @brief Updates the route path to the node `cheapest.index`
-     * via the path from `from_node` via `cheapest.prev_edge`
-     */
+    // Update the route path to the node `cheapest.index` via the path from
+    // `from_node` via `cheapest.prev_edge`.
     inline void update_cheapest(RTExploredNode& cheapest, size_t thread_idx) {
         const RRNodeId& inode = cheapest.index;
         add_to_mod_list(inode, thread_idx);
-        this->rr_node_route_inf_[inode].prev_edge = cheapest.prev_edge;
-        this->rr_node_route_inf_[inode].path_cost = cheapest.total_cost;
-        this->rr_node_route_inf_[inode].backward_path_cost = cheapest.backward_path_cost;
+        rr_node_route_inf_[inode].prev_edge = cheapest.prev_edge;
+        rr_node_route_inf_[inode].path_cost = cheapest.total_cost;
+        rr_node_route_inf_[inode].backward_path_cost = cheapest.backward_path_cost;
     }
 
-    /**
-     * @brief Obtains the per-node spin locks for protecting node cost updates
-     */
     inline void obtainSpinLock(const RRNodeId& inode) {
-        this->locks_[size_t(inode)].acquire();
+        locks_[size_t(inode)].acquire();
     }
 
-    /**
-     * @brief Releases the per-node spin lock, allowing other
-     * threads working on the same node to obtain it
-     */
     inline void releaseLock(const RRNodeId& inode) {
-        this->locks_[size_t(inode)].release();
+        locks_[size_t(inode)].release();
     }
 
-    /**
-     * @brief Finds the single shortest path from current heap to the sink node in the RR graph
-     * @param sink_node Sink node ID to route to
-     * @param cost_params Cost function parameters
-     * @param bounding_box Keep search confined to this bounding box
-     * @param target_bb Prune IPINs that lead to blocks other than the target block
-     */
-    void timing_driven_find_single_shortest_path_from_heap(RRNodeId sink_node,
-                                                           const t_conn_cost_params& cost_params,
-                                                           const t_bb& bounding_box,
-                                                           const t_bb& target_bb) final;
+    /** Common logic from timing_driven_route_connection_from_route_tree and
+     * timing_driven_route_connection_from_route_tree_high_fanout for running
+     * the connection router.
+     * @param[in] rt_root RouteTreeNode describing the current routing state
+     * @param[in] sink_node Sink node ID to route to
+     * @param[in] cost_params
+     * @param[in] bounding_box Keep search confined to this bounding box
+     * @return bool Signal to retry this connection with a full-device bounding box */
+    bool timing_driven_route_connection_common_setup(
+        const RouteTreeNode& rt_root,
+        RRNodeId sink_node,
+        const t_conn_cost_params& cost_params,
+        const t_bb& bounding_box);
 
-    /**
-     * @brief Helper thread wrapper function, passed to std::thread instantiation and running a
-     * while-loop to obtain and execute new helper thread tasks until the main thread signals the
-     * threads to exit
-     * @param thread_idx Thread ID (0 means main thread; 1 to #threads-1 means helper threads)
-     */
-    void timing_driven_find_single_shortest_path_from_heap_sub_thread_wrapper(
+    // Finds a path to sink_node, starting from the elements currently in the
+    // heap.
+    //
+    // If the path is not found, which means that the path_cost of sink_node in
+    // RR node route info has never been updated, `rr_node_route_inf_[sink_node]
+    // .path_cost` will be the initial value (i.e., float infinity). This case
+    // can be detected by `std::isinf(rr_node_route_inf_[sink_node].path_cost)`.
+    //
+    // This is the core maze routing routine.
+    //
+    // Note: For understanding the connection router, start here.
+    void timing_driven_route_connection_from_heap(
+        RRNodeId sink_node,
+        const t_conn_cost_params& cost_params,
+        const t_bb& bounding_box);
+
+    void timing_driven_route_connection_from_heap_sub_thread_wrapper(
         const size_t thread_idx);
 
-    /**
-     * @brief Helper thread task function to find the single shortest path from current heap to
-     * the sink node in the RR graph
-     * @param sink_node Sink node ID to route to
-     * @param cost_params Cost function parameters
-     * @param bounding_box Keep search confined to this bounding box
-     * @param target_bb Prune IPINs that lead to blocks other than the target block
-     * @param thread_idx Thread ID (0 means main thread; 1 to #threads-1 means helper threads)
-     */
-    void timing_driven_find_single_shortest_path_from_heap_thread_func(
+    void timing_driven_route_connection_from_heap_thread_func(
         RRNodeId sink_node,
         const t_conn_cost_params& cost_params,
         const t_bb& bounding_box,
         const t_bb& target_bb,
         const size_t thread_idx);
 
-    /**
-     * @brief Expands each neighbor of the current node in the wave expansion
-     * @param current Current node being explored
-     * @param cost_params Cost function parameters
-     * @param bounding_box Keep search confined to this bounding box
-     * @param target_node Target node ID to route to
-     * @param target_bb Prune IPINs that lead to blocks other than the target block
-     * @param thread_idx Thread ID (0 means main thread; 1 to #threads-1 means helper threads)
-     */
+    // Expand each neighbor of the current node.
     void timing_driven_expand_neighbours(
         const RTExploredNode& current,
         const t_conn_cost_params& cost_params,
@@ -331,18 +308,11 @@ class ParallelConnectionRouter : public ConnectionRouter<HeapImplementation> {
         const t_bb& target_bb,
         size_t thread_idx);
 
-    /**
-     * @brief Conditionally adds to_node to the router heap (via path from current.index via from_edge)
-     * @note RR nodes outside bounding box specified in bounding_box are not added to the heap.
-     * @param current Current node being explored
-     * @param from_edge Edge between the current node and the neighbor node
-     * @param to_node Neighbor node to be expanded
-     * @param cost_params Cost function parameters
-     * @param bounding_box Keep search confined to this bounding box
-     * @param target_node Target node ID to route to
-     * @param target_bb Prune IPINs that lead to blocks other than the target block
-     * @param thread_idx Thread ID (0 means main thread; 1 to #threads-1 means helper threads)
-     */
+    // Conditionally adds to_node to the router heap (via path from current.index
+    // via from_edge).
+    //
+    // RR nodes outside bounding box specified in bounding_box are not added
+    // to the heap.
     void timing_driven_expand_neighbour(
         const RTExploredNode& current,
         RREdgeId from_edge,
@@ -353,15 +323,8 @@ class ParallelConnectionRouter : public ConnectionRouter<HeapImplementation> {
         const t_bb& target_bb,
         size_t thread_idx);
 
-    /**
-     * @brief Adds to_node to the heap, and also adds any nodes which are connected by non-configurable edges
-     * @param cost_params Cost function parameters
-     * @param current Current node being explored
-     * @param to_node Neighbor node to be expanded
-     * @param from_edge Edge between the current node and the neighbor node
-     * @param target_node Target node ID to route to
-     * @param thread_idx Thread ID (0 means main thread; 1 to #threads-1 means helper threads)
-     */
+    // Add to_node to the heap, and also add any nodes which are connected by
+    // non-configurable edges
     void timing_driven_add_to_heap(
         const t_conn_cost_params& cost_params,
         const RTExploredNode& current,
@@ -370,61 +333,78 @@ class ParallelConnectionRouter : public ConnectionRouter<HeapImplementation> {
         RRNodeId target_node,
         size_t thread_idx);
 
-    /**
-     * @brief Unconditionally adds rt_node to the heap
-     * @note If you want to respect rt_node->re_expand that is the caller's responsibility.
-     * @todo Consider moving this function into the ConnectionRouter class after checking
-     * the different prune functions of the serial and parallel connection routers.
-     * @param rt_node RouteTreeNode to be added to the heap
-     * @param target_node Target node ID to route to
-     * @param cost_params Cost function parameters
-     * @param net_bb Do not push to heap if not in bounding box
-     */
+    // Calculates the cost of reaching to_node
+    void evaluate_timing_driven_node_costs(
+        RTExploredNode* to,
+        const t_conn_cost_params& cost_params,
+        RRNodeId from_node,
+        RRNodeId target_node);
+
+    // Find paths from current heap to all nodes in the RR graph
+    vtr::vector<RRNodeId, RTExploredNode> timing_driven_find_all_shortest_paths_from_heap(
+        const t_conn_cost_params& cost_params,
+        const t_bb& bounding_box);
+
+    //Adds the route tree rooted at rt_node to the heap, preparing it to be
+    //used as branch-points for further routing.
+    void add_route_tree_to_heap(const RouteTreeNode& rt_node,
+                                RRNodeId target_node,
+                                const t_conn_cost_params& cost_params,
+                                const t_bb& net_bb);
+
+    //Unconditionally adds rt_node to the heap
+    //
+    //Note that if you want to respect rt_node->re_expand that is the caller's
+    //responsibility.
     void add_route_tree_node_to_heap(
         const RouteTreeNode& rt_node,
         RRNodeId target_node,
         const t_conn_cost_params& cost_params,
-        const t_bb& net_bb) final;
+        const t_bb& net_bb);
 
-    /**
-     * @brief [Not supported] Finds shortest paths from current heap to all nodes in the RR graph
-     * @note This function has not been implemented yet and is not the focus of parallel connection router.
-     * Thus this function is not expected to be called.
-     */
-    vtr::vector<RRNodeId, RTExploredNode> timing_driven_find_all_shortest_paths_from_heap(
-        const t_conn_cost_params&,
-        const t_bb&) final {
-        VPR_FATAL_ERROR(VPR_ERROR_ROUTE, "timing_driven_find_all_shortest_paths_from_heap not yet implemented (nor is the focus of this project). Not expected to be called.");
-    }
+    t_bb add_high_fanout_route_tree_to_heap(
+        const RouteTreeNode& rt_root,
+        RRNodeId target_node,
+        const t_conn_cost_params& cost_params,
+        const SpatialRouteTreeLookup& spatial_route_tree_lookup,
+        const t_bb& net_bounding_box);
 
-    /** Node IDs of modified nodes in rr_node_route_inf for each thread*/
+    const DeviceGrid& grid_;
+    const RouterLookahead& router_lookahead_;
+    const t_rr_graph_view rr_nodes_;
+    const RRGraphView* rr_graph_;
+    vtr::array_view<const t_rr_rc_data> rr_rc_data_;
+    vtr::array_view<const t_rr_switch_inf> rr_switch_inf_;
+    const vtr::vector<ParentNetId, std::vector<std::vector<int>>>& net_terminal_groups;
+    const vtr::vector<ParentNetId, std::vector<int>>& net_terminal_group_num;
+    vtr::vector<RRNodeId, t_rr_node_route_inf>& rr_node_route_inf_;
+    bool is_flat_;
     std::vector<std::vector<RRNodeId>> modified_rr_node_inf_;
-
-    /** MultiQueue-based parallel heap */
+    RouterStats* router_stats_;
+    const ConnectionParameters* conn_params_;
     MultiQueueDAryHeap<HeapImplementation::arg_D> heap_;
-
-    /** Helper threads */
     std::vector<std::thread> sub_threads_;
-
-    /** Thread barrier for synchronization */
     barrier_t thread_barrier_;
-
-    /** Signal for helper threads to exit */
     std::atomic<bool> is_router_destroying_;
-
-    /** Fine-grained locks per RR node */
     std::vector<spin_lock_t> locks_;
-
-    /** Is queue draining optimization enabled? */
     bool multi_queue_direct_draining_;
 
-    //@{
-    /** Atomic parameters of thread task functions to pass from main thread to helper threads */
+    bool router_debug_;
+
+    bool only_opin_inter_layer;
+
     std::atomic<RRNodeId*> sink_node_;
     std::atomic<t_conn_cost_params*> cost_params_;
     std::atomic<t_bb*> bounding_box_;
     std::atomic<t_bb*> target_bb_;
-    //@}
+
+    // Cumulative time spent in the path search part of the connection router.
+    std::chrono::microseconds path_search_cumulative_time;
+
+    // The path manager for RCV, keeps track of the route tree as a set, also
+    // manages the allocation of `rcv_path_data`.
+    PathManager rcv_path_manager;
+    vtr::vector<RRNodeId, t_heap_path*> rcv_path_data;
 };
 
 /** Construct a parallel connection router that uses the specified heap type.
