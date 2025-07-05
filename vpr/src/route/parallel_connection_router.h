@@ -10,6 +10,9 @@
 #include <mutex>
 #include <condition_variable>
 
+#include <fstream>
+#include <chrono>
+
 /**
  * @brief Spin lock implementation using std::atomic_flag
  *
@@ -219,6 +222,13 @@ class ParallelConnectionRouter : public ConnectionRouter<MultiQueueDAryHeap<Heap
         for (int i = 0; i < multi_queue_num_threads - 1; ++i) {
             this->sub_threads_[i] = std::thread(&ParallelConnectionRouter::timing_driven_find_single_shortest_path_from_heap_sub_thread_wrapper, this, i + 1 /*0: main thread*/);
         }
+
+        using namespace std::chrono_literals;
+        this->profile_1_total_time_at_heap_thread_func.resize(multi_queue_num_threads, 0us);
+        this->profile_2_total_waiting_time_at_try_pop.resize(multi_queue_num_threads, 0us);
+        this->profile_3_total_waiting_time_at_first_lock_acquiring_to_get_best_node.resize(multi_queue_num_threads, 0us);
+        this->profile_4_total_time_at_neighbor_expansion.resize(multi_queue_num_threads, 0us);
+        this->profile_5_total_waiting_time_at_second_lock_acquiring_to_update_global_states.resize(multi_queue_num_threads, 0us);
     }
 
     ~ParallelConnectionRouter() {
@@ -244,6 +254,23 @@ class ParallelConnectionRouter : public ConnectionRouter<MultiQueueDAryHeap<Heap
 
         VTR_LOG("Parallel Connection Router is being destroyed. Time spent on path search: %.3f seconds.\n",
                 std::chrono::duration<float /*convert to seconds by default*/>(this->path_search_cumulative_time).count());
+        std::ofstream profile_csv_file("parallel_connection_router_profiling_results.csv");
+        profile_csv_file << "thread_index,"
+                            "profile_1_total_time_unit_sec_at_heap_thread_func,"
+                            "profile_2_total_waiting_time_unit_sec_at_try_pop,"
+                            "profile_3_total_waiting_time_unit_sec_at_first_lock_acquiring_to_get_best_node,"
+                            "profile_4_total_time_unit_sec_at_neighbor_expansion,"
+                            "profile_5_total_waiting_time_unit_sec_at_second_lock_acquiring_to_update_global_states\n";
+        auto num_threads_used = this->profile_1_total_time_at_heap_thread_func.size();
+        for (size_t thread_idx = 0; thread_idx < num_threads_used; ++thread_idx) {
+            profile_csv_file << std::format("{},{:6f},{:6f},{:6f},{:6f},{:6f}\n",
+                                            thread_idx,
+                                            std::chrono::duration<float /*sec*/>(this->profile_1_total_time_at_heap_thread_func[thread_idx]).count(),
+                                            std::chrono::duration<float /*sec*/>(this->profile_2_total_waiting_time_at_try_pop[thread_idx]).count(),
+                                            std::chrono::duration<float /*sec*/>(this->profile_3_total_waiting_time_at_first_lock_acquiring_to_get_best_node[thread_idx]).count(),
+                                            std::chrono::duration<float /*sec*/>(this->profile_4_total_time_at_neighbor_expansion[thread_idx]).count(),
+                                            std::chrono::duration<float /*sec*/>(this->profile_5_total_waiting_time_at_second_lock_acquiring_to_update_global_states[thread_idx]).count());
+        }
     }
 
     /**
@@ -461,6 +488,12 @@ class ParallelConnectionRouter : public ConnectionRouter<MultiQueueDAryHeap<Heap
 
     /** Fine-grained locks per RR node */
     std::vector<spin_lock_t> locks_;
+
+    std::vector<std::chrono::microseconds> profile_1_total_time_at_heap_thread_func;
+    std::vector<std::chrono::microseconds> profile_2_total_waiting_time_at_try_pop;
+    std::vector<std::chrono::microseconds> profile_3_total_waiting_time_at_first_lock_acquiring_to_get_best_node;
+    std::vector<std::chrono::microseconds> profile_4_total_time_at_neighbor_expansion;
+    std::vector<std::chrono::microseconds> profile_5_total_waiting_time_at_second_lock_acquiring_to_update_global_states;
 
     /** Is queue draining optimization enabled? */
     bool multi_queue_direct_draining_;

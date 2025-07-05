@@ -1,6 +1,7 @@
 #include "parallel_connection_router.h"
 
 #include <algorithm>
+#include <chrono>
 #include "d_ary_heap.h"
 #include "route_tree.h"
 #include "rr_graph_fwd.h"
@@ -213,8 +214,21 @@ void ParallelConnectionRouter<Heap>::timing_driven_find_single_shortest_path_fro
                                                                                                    const t_bb& bounding_box,
                                                                                                    const t_bb& target_bb,
                                                                                                    const size_t thread_idx) {
+    auto thread_func_start_time = std::chrono::steady_clock::now();
     HeapNode cheapest;
-    while (this->heap_.try_pop(cheapest)) {
+    while (true) {
+        bool is_exit = false;
+        {
+            auto start_time = std::chrono::steady_clock::now();
+            is_exit = !(this->heap_.try_pop(cheapest));
+            auto end_time = std::chrono::steady_clock::now();
+            profile_2_total_waiting_time_at_try_pop[thread_idx] += std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        }
+
+        if (is_exit) {
+            break;
+        }
+
         // Pop a new inode with the cheapest total cost in current route tree to be expanded on
         const auto& [new_total_cost, inode] = cheapest;
 
@@ -224,7 +238,12 @@ void ParallelConnectionRouter<Heap>::timing_driven_find_single_shortest_path_fro
         }
 
         // Get the current RR node info within a critical section to prevent data races
-        obtainSpinLock(inode);
+        {
+            auto start_time = std::chrono::steady_clock::now();
+            obtainSpinLock(inode);
+            auto end_time = std::chrono::steady_clock::now();
+            profile_3_total_waiting_time_at_first_lock_acquiring_to_get_best_node[thread_idx] += std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        }
 
         RTExploredNode current;
         current.index = inode;
@@ -248,8 +267,16 @@ void ParallelConnectionRouter<Heap>::timing_driven_find_single_shortest_path_fro
         }
 
         // Adding nodes to heap
-        timing_driven_expand_neighbours(current, cost_params, bounding_box, sink_node, target_bb, thread_idx);
+        {
+            auto start_time = std::chrono::steady_clock::now();
+            timing_driven_expand_neighbours(current, cost_params, bounding_box, sink_node, target_bb, thread_idx);
+            auto end_time = std::chrono::steady_clock::now();
+            profile_4_total_time_at_neighbor_expansion[thread_idx] += std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        }
     }
+
+    auto thread_func_end_time = std::chrono::steady_clock::now();
+    profile_1_total_time_at_heap_thread_func[thread_idx] += std::chrono::duration_cast<std::chrono::microseconds>(thread_func_end_time - thread_func_start_time);
 }
 
 template<typename Heap>
@@ -381,7 +408,12 @@ void ParallelConnectionRouter<Heap>::timing_driven_add_to_heap(const t_conn_cost
         return;
     }
 
-    obtainSpinLock(to_node);
+    {
+        auto start_time = std::chrono::steady_clock::now();
+        obtainSpinLock(to_node);
+        auto end_time = std::chrono::steady_clock::now();
+        profile_5_total_waiting_time_at_second_lock_acquiring_to_update_global_states[thread_idx] += std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    }
 
     if (prune_node(to_node, new_total_cost, new_back_cost, from_edge, target_node, this->rr_node_route_inf_, cost_params)) {
         releaseLock(to_node);
